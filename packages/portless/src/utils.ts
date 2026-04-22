@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { execFileSync } from "node:child_process";
 
 /**
  * When running under sudo, fix file ownership so the real user can
@@ -48,6 +49,28 @@ export function formatUrl(hostname: string, proxyPort: number, tls = false): str
   return proxyPort === defaultPort
     ? `${proto}://${hostname}`
     : `${proto}://${hostname}:${proxyPort}`;
+}
+
+/**
+ * Detect whether the process is running inside WSL by inspecting /proc/version.
+ */
+export function isWSL(): boolean {
+  try {
+    return fs.readFileSync("/proc/version", "utf-8").toLowerCase().includes("microsoft");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Convert a WSL (POSIX) path to a Windows path using wslpath.
+ */
+export function wslToWindowsPath(wslPath: string): string {
+  return execFileSync("wslpath", ["-w", wslPath], {
+    encoding: "utf-8",
+    timeout: 5000,
+    stdio: ["pipe", "pipe", "pipe"],
+  }).trim();
 }
 
 /**

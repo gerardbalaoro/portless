@@ -735,7 +735,11 @@ async function handleTrust(): Promise<void> {
   const result = trustCA(dir);
   if (result.trusted) {
     console.log(chalk.green("Local CA added to system trust store."));
-    console.log(chalk.gray("Browsers will now trust portless HTTPS certificates."));
+    if (result.error) {
+      console.warn(chalk.yellow(`Warning: ${result.error}`));
+    } else {
+      console.log(chalk.gray("Browsers will now trust portless HTTPS certificates."));
+    }
   } else {
     console.error(chalk.red(`Failed to trust CA: ${result.error}`));
     if (result.error?.includes("sudo")) {
@@ -1099,9 +1103,12 @@ ${chalk.bold("Usage:")}
         console.log(chalk.yellow("Adding CA to system trust store..."));
         const trustResult = trustCA(stateDir);
         if (trustResult.trusted) {
-          console.log(
-            chalk.green("CA added to system trust store. Browsers will trust portless certs.")
-          );
+          console.log(chalk.green("CA added to system trust store."));
+          if (trustResult.error) {
+            console.warn(chalk.yellow(`Warning: ${trustResult.error}`));
+          } else {
+            console.log(chalk.gray("Browsers will trust portless certs."));
+          }
         } else {
           console.warn(chalk.yellow("Could not add CA to system trust store."));
           if (trustResult.error) {

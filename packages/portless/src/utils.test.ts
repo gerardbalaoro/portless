@@ -1,5 +1,63 @@
-import { describe, it, expect } from "vitest";
-import { escapeHtml, formatUrl, isErrnoException, parseHostname } from "./utils.js";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import * as fs from "node:fs";
+import {
+  escapeHtml,
+  formatUrl,
+  isErrnoException,
+  isWSL,
+  parseHostname,
+  wslToWindowsPath,
+} from "./utils.js";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
+});
+
+describe("isWSL", () => {
+  afterEach(() => {
+    vi.mocked(fs.readFileSync).mockClear();
+  });
+
+  it("returns true when /proc/version contains 'microsoft'", () => {
+    vi.mocked(fs.readFileSync).mockReturnValueOnce(
+      "Linux version 5.15.0-microsoft-standard-WSL2 (gcc version 11.2.0)"
+    );
+    expect(isWSL()).toBe(true);
+  });
+
+  it("is case-insensitive", () => {
+    vi.mocked(fs.readFileSync).mockReturnValueOnce("Linux version Microsoft WSL");
+    expect(isWSL()).toBe(true);
+  });
+
+  it("returns false when /proc/version does not contain 'microsoft'", () => {
+    vi.mocked(fs.readFileSync).mockReturnValueOnce("Linux version 6.1.0-generic #1 SMP Ubuntu");
+    expect(isWSL()).toBe(false);
+  });
+
+  it("returns false when /proc/version cannot be read", () => {
+    vi.mocked(fs.readFileSync).mockImplementationOnce(() => {
+      throw new Error("ENOENT");
+    });
+    expect(isWSL()).toBe(false);
+  });
+});
+
+describe("wslToWindowsPath", () => {
+  it("converts /mnt/c to C:\\ (Windows drive path)", () => {
+    const running = fs.readFileSync("/proc/version", "utf-8").toLowerCase().includes("microsoft");
+    if (!running) return;
+    expect(wslToWindowsPath("/mnt/c")).toMatch(/^C:\\/i);
+  });
+
+  it("converts a WSL-native path to UNC or drive format", () => {
+    const running = fs.readFileSync("/proc/version", "utf-8").toLowerCase().includes("microsoft");
+    if (!running) return;
+    // /tmp lives inside the distro fs — wslpath -w gives \\wsl.localhost\<distro>\tmp
+    expect(wslToWindowsPath("/tmp")).toMatch(/^(\\\\|[A-Za-z]:\\)/);
+  });
+});
 
 describe("escapeHtml", () => {
   it("escapes angle brackets", () => {

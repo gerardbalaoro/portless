@@ -4,7 +4,7 @@ import * as crypto from "node:crypto";
 import * as tls from "node:tls";
 import { execFile as execFileCb, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { fixOwnership } from "./utils.js";
+import { fixOwnership, isWSL, wslToWindowsPath } from "./utils.js";
 
 /** How long the CA certificate is valid (10 years, in days). */
 const CA_VALIDITY_DAYS = 3650;
@@ -294,7 +294,9 @@ export function isCATrusted(stateDir: string): boolean {
   if (process.platform === "darwin") {
     return isCATrustedMacOS(caCertPath);
   } else if (process.platform === "linux") {
-    return isCATrustedLinux(stateDir);
+    if (!isCATrustedLinux(stateDir)) return false;
+    if (isWSL()) return isCATrustedWindows(caCertPath);
+    return true;
   }
   return false;
 }
@@ -638,12 +640,93 @@ export function createSNICallback(
   };
 }
 
+// ---------------------------------------------------------------------------
+// WSL (Windows Subsystem for Linux) helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Check if the CA is trusted in the Windows certificate store.
+ * Checks both LocalMachine\Root and CurrentUser\Root.
+ */
+function isCATrustedWindows(caCertPath: string): boolean {
+  try {
+    const fingerprint = openssl(["x509", "-in", caCertPath, "-noout", "-fingerprint", "-sha1"])
+      .trim()
+      .replace(/^.*=/, "")
+      .replace(/:/g, "")
+      .toLowerCase();
+
+    for (const args of [
+      ["certutil.exe", "-store", "Root"],
+      ["certutil.exe", "-user", "-store", "Root"],
+    ] as const) {
+      try {
+        const result = execFileSync(args[0], args.slice(1), {
+          encoding: "utf-8",
+          timeout: 10_000,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        if (result.toLowerCase().replace(/[:\s]/g, "").includes(fingerprint)) return true;
+      } catch {
+        // store not accessible, try next
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Add the portless CA to the Windows certificate store from WSL.
+ * Tries LocalMachine\Root first (requires admin); falls back to CurrentUser\Root.
+ */
+function trustCAWindows(caCertPath: string): { trusted: boolean; error?: string } {
+  try {
+    const winPath = wslToWindowsPath(caCertPath);
+
+    // Try machine store first (trusted by all users/browsers)
+    let machineError: string | undefined;
+    try {
+      execFileSync("certutil.exe", ["-addstore", "Root", winPath], {
+        stdio: "pipe",
+        timeout: 30_000,
+      });
+      return { trusted: true };
+    } catch (err: unknown) {
+      machineError = err instanceof Error ? err.message : String(err);
+    }
+
+    // Fall back to current-user store (no admin required, trusted by Chrome/Edge)
+    try {
+      execFileSync("certutil.exe", ["-user", "-addstore", "Root", winPath], {
+        stdio: "pipe",
+        timeout: 30_000,
+      });
+      return { trusted: true };
+    } catch (err: unknown) {
+      const userError = err instanceof Error ? err.message : String(err);
+      return {
+        trusted: false,
+        error: `Windows trust store: machine store: ${machineError}; user store: ${userError}. Try running as Windows administrator.`,
+      };
+    }
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      trusted: false,
+      error: `Windows trust store: ${message}. Try running as Windows administrator.`,
+    };
+  }
+}
+
 /**
  * Add the portless CA to the system trust store.
  *
  * On macOS, adds to the login keychain (no sudo required -- the OS shows a
  * GUI authorization prompt to confirm). On Linux, copies to the distro-specific
  * CA directory and runs the appropriate update command (requires sudo).
+ * On WSL, also propagates to the Windows certificate store.
  *
  * Supported Linux distros: Debian/Ubuntu, Arch, Fedora/RHEL/CentOS, openSUSE.
  */
@@ -670,6 +753,16 @@ export function trustCA(stateDir: string): { trusted: boolean; error?: string } 
       const dest = path.join(config.certDir, "portless-ca.crt");
       fs.copyFileSync(caCertPath, dest);
       execFileSync(config.updateCommand, [], { stdio: "pipe", timeout: 30_000 });
+
+      if (isWSL()) {
+        const winResult = trustCAWindows(caCertPath);
+        if (!winResult.trusted) {
+          // Linux trust store already updated; report Windows failure as a warning
+          // so the caller knows the host browser won't trust the cert yet.
+          return { trusted: true, error: winResult.error };
+        }
+      }
+
       return { trusted: true };
     }
     return { trusted: false, error: `Unsupported platform: ${process.platform}` };
