@@ -1776,6 +1776,9 @@ async function handleTrust(): Promise<void> {
   if (result.trusted) {
     console.log(colors.green("Local CA added to system trust store."));
     console.log(colors.gray("Browsers will now trust portless HTTPS certificates."));
+    if (result.warning) {
+      console.warn(colors.yellow(result.warning));
+    }
     return;
   }
 
@@ -3060,6 +3063,9 @@ ${colors.bold("LAN mode (--lan):")}
           console.log(
             colors.green("CA added to system trust store. Browsers will trust portless certs.")
           );
+          if (trustResult.warning) {
+            console.warn(colors.yellow(trustResult.warning));
+          }
         } else {
           console.warn(colors.yellow("Could not add CA to system trust store."));
           if (trustResult.error) {
