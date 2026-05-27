@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as path from "node:path";
 import {
   buildServiceSpec,
   buildServiceUninstallSudoArgs,
@@ -13,6 +14,7 @@ vi.mock("node:fs", async (importOriginal) => {
     chmodSync: vi.fn(),
     existsSync: vi.fn(mod.existsSync),
     mkdirSync: vi.fn(),
+    readFileSync: vi.fn(mod.readFileSync),
     rmSync: vi.fn(),
     writeFileSync: vi.fn(),
   };
@@ -33,7 +35,23 @@ vi.mock("./utils.js", () => ({
   fixOwnership: vi.fn(),
 }));
 
-const { existsSync, rmSync } = await import("node:fs");
+vi.mock("./mdns.js", () => ({
+  isMdnsSupported: vi.fn(() => ({ supported: true })),
+}));
+
+vi.mock("./cli-utils.js", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("./cli-utils.js")>();
+  return {
+    ...mod,
+    discoverState: vi.fn(mod.discoverState),
+    isProxyRunning: vi.fn(mod.isProxyRunning),
+  };
+});
+
+const { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } = await import("node:fs");
+const { isMdnsSupported } = await import("./mdns.js");
+const { discoverState, isProxyRunning } = await import("./cli-utils.js");
+const actualCliUtils = await vi.importActual<typeof import("./cli-utils.js")>("./cli-utils.js");
 
 const originalPlatform = process.platform;
 const originalGetuid = process.getuid;
@@ -62,7 +80,15 @@ afterEach(() => {
     value: originalGetuid,
   });
   vi.mocked(existsSync).mockRestore();
+  vi.mocked(mkdirSync).mockRestore();
+  vi.mocked(readFileSync).mockRestore();
   vi.mocked(rmSync).mockRestore();
+  vi.mocked(writeFileSync).mockRestore();
+  vi.mocked(isMdnsSupported).mockReturnValue({ supported: true });
+  vi.mocked(discoverState).mockReset();
+  vi.mocked(discoverState).mockImplementation(actualCliUtils.discoverState);
+  vi.mocked(isProxyRunning).mockReset();
+  vi.mocked(isProxyRunning).mockImplementation(actualCliUtils.isProxyRunning);
 });
 
 describe("buildServiceSpec", () => {
@@ -199,6 +225,65 @@ describe("buildServiceSpec", () => {
     expect(spec.plist).toContain("<key>KeepAlive</key>\n  <true/>");
     expect(spec.plist).not.toContain("SuccessfulExit");
   });
+
+  it("persists LAN and wildcard settings in a macOS LaunchDaemon", () => {
+    const spec = buildServiceSpec({
+      platform: "darwin",
+      nodePath: "/usr/local/bin/node",
+      entryScript: "/usr/local/lib/portless/cli.js",
+      userHome: "/Users/alice",
+      uid: "501",
+      gid: "20",
+      installConfig: {
+        proxyPort: 8443,
+        lanMode: true,
+        lanIp: "192.168.1.42",
+        lanIpExplicit: true,
+        useWildcard: true,
+      },
+    });
+
+    if (spec.platform !== "darwin") throw new Error("Expected macOS service spec");
+    expect(spec.programArguments).toContain("--lan");
+    expect(spec.programArguments).toContain("--ip");
+    expect(spec.programArguments).toContain("192.168.1.42");
+    expect(spec.programArguments).toContain("--wildcard");
+    expect(spec.programArguments).toContain("8443");
+    expect(spec.plist).toContain("<key>PORTLESS_LAN</key>");
+    expect(spec.plist).toContain("<string>1</string>");
+    expect(spec.plist).toContain("<key>PORTLESS_LAN_IP</key>");
+    expect(spec.plist).toContain("<string>192.168.1.42</string>");
+    expect(spec.plist).toContain("<key>PORTLESS_WILDCARD</key>");
+  });
+
+  it("persists no-TLS, custom TLD, and custom state in a Linux service", () => {
+    const spec = buildServiceSpec({
+      platform: "linux",
+      nodePath: "/usr/bin/node",
+      entryScript: "/usr/lib/node_modules/portless/dist/cli.js",
+      userHome: "/home/alice",
+      uid: "1000",
+      gid: "1000",
+      installConfig: {
+        stateDir: "/srv/portless",
+        proxyPort: 8080,
+        useHttps: false,
+        tld: "test",
+        useWildcard: true,
+      },
+    });
+
+    if (spec.platform !== "linux") throw new Error("Expected Linux service spec");
+    expect(spec.execStart).toContain("--no-tls");
+    expect(spec.execStart).toContain("--tld");
+    expect(spec.execStart).toContain("test");
+    expect(spec.execStart).toContain("--wildcard");
+    expect(spec.unit).toContain('Environment=PORTLESS_STATE_DIR="/srv/portless"');
+    expect(spec.unit).toContain('Environment=PORTLESS_PORT="8080"');
+    expect(spec.unit).toContain('Environment=PORTLESS_HTTPS="0"');
+    expect(spec.unit).toContain('Environment=PORTLESS_TLD="test"');
+    expect(spec.stateDir).toBe("/srv/portless");
+  });
 });
 
 describe("buildServiceUninstallSudoArgs", () => {
@@ -317,6 +402,29 @@ describe("handleService", () => {
     expect(output).toContain("bogus");
   });
 
+  it("rejects unsupported LAN service installs before writing a Windows task", async () => {
+    setPlatform("win32");
+    vi.mocked(isMdnsSupported).mockReturnValue({
+      supported: false,
+      reason: "mDNS publishing is not supported on this platform",
+    });
+    const runner = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
+
+    await expect(
+      handleService(["service", "install", "--lan"], {
+        entryScript: "/fake/cli.js",
+        runner,
+      })
+    ).rejects.toThrow("process.exit");
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(runner).not.toHaveBeenCalled();
+    expect(mkdirSync).not.toHaveBeenCalled();
+    expect(writeFileSync).not.toHaveBeenCalled();
+    const output = errorSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
+    expect(output).toContain("LAN mode requires mDNS publishing");
+  });
+
   it("stops an existing proxy before restarting the Linux service", async () => {
     setPlatform("linux");
     setGetuid(0);
@@ -343,5 +451,190 @@ describe("handleService", () => {
 
     expect(stopIndex).toBeGreaterThanOrEqual(0);
     expect(restartIndex).toBeGreaterThan(stopIndex);
+  });
+
+  it("uses install flags when stopping an existing proxy before restart", async () => {
+    setPlatform("linux");
+    setGetuid(0);
+    const runner = vi.fn((_: string, _args: string[]) => ({
+      status: 0,
+      stdout: "",
+      stderr: "",
+    }));
+
+    await handleService(["service", "install", "--port", "8443", "--wildcard"], {
+      entryScript: "/fake/cli.js",
+      runner,
+    });
+
+    const calls = runner.mock.calls.map(([command, args]) => ({ command, args }));
+    expect(calls).toContainEqual({
+      command: process.execPath,
+      args: ["/fake/cli.js", "proxy", "stop", "--port", "8443"],
+    });
+  });
+
+  it("stops the discovered proxy before a different install port", async () => {
+    setPlatform("linux");
+    setGetuid(0);
+    const currentPort = 19000;
+    const targetPort = 19001;
+    vi.mocked(discoverState).mockResolvedValue({
+      dir: "/tmp/portless-service-current-test",
+      port: currentPort,
+      tls: true,
+      tld: "localhost",
+      lanMode: false,
+      lanIp: null,
+    });
+    vi.mocked(isProxyRunning).mockImplementation(async (port) => port === currentPort);
+    const runner = vi.fn((_: string, _args: string[]) => ({
+      status: 0,
+      stdout: "",
+      stderr: "",
+    }));
+
+    await handleService(["service", "install", "--port", targetPort.toString()], {
+      entryScript: "/fake/cli.js",
+      runner,
+    });
+
+    const stopPorts = runner.mock.calls
+      .filter(
+        ([command, args]) =>
+          command === process.execPath &&
+          args[0] === "/fake/cli.js" &&
+          args[1] === "proxy" &&
+          args[2] === "stop"
+      )
+      .map(([, args]) => args[4]);
+    expect(stopPorts).toEqual([currentPort.toString(), targetPort.toString()]);
+  });
+
+  it("does not validate proxy env while uninstalling", async () => {
+    setPlatform("linux");
+    setGetuid(0);
+    const originalPort = process.env.PORTLESS_PORT;
+    const originalTld = process.env.PORTLESS_TLD;
+    process.env.PORTLESS_PORT = "abc";
+    process.env.PORTLESS_TLD = "bad-name";
+    const runner = vi.fn((_: string, _args: string[]) => ({
+      status: 0,
+      stdout: "",
+      stderr: "",
+    }));
+
+    try {
+      await handleService(["service", "uninstall"], {
+        entryScript: "/fake/cli.js",
+        runner,
+      });
+    } finally {
+      if (originalPort === undefined) {
+        delete process.env.PORTLESS_PORT;
+      } else {
+        process.env.PORTLESS_PORT = originalPort;
+      }
+      if (originalTld === undefined) {
+        delete process.env.PORTLESS_TLD;
+      } else {
+        process.env.PORTLESS_TLD = originalTld;
+      }
+    }
+
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(runner).toHaveBeenCalledWith("systemctl", ["disable", "--now", "portless.service"]);
+  });
+
+  it("normalizes relative install paths before writing the Linux service", async () => {
+    setPlatform("linux");
+    setGetuid(0);
+    const runner = vi.fn((_: string, _args: string[]) => ({
+      status: 0,
+      stdout: "",
+      stderr: "",
+    }));
+
+    await handleService(
+      [
+        "service",
+        "install",
+        "--state-dir",
+        "relative-state",
+        "--cert",
+        "cert.pem",
+        "--key",
+        "key.pem",
+      ],
+      {
+        entryScript: "/fake/cli.js",
+        runner,
+      }
+    );
+
+    const stateDir = path.resolve("relative-state");
+    const certPath = path.resolve("cert.pem");
+    const keyPath = path.resolve("key.pem");
+    const systemdStateDir = stateDir.replace(/\\/g, "\\\\");
+    const systemdCertPath = certPath.replace(/\\/g, "\\\\");
+    const systemdKeyPath = keyPath.replace(/\\/g, "\\\\");
+    const unitWrite = vi
+      .mocked(writeFileSync)
+      .mock.calls.find(([file]) => file === "/etc/systemd/system/portless.service");
+    const unit = String(unitWrite?.[1] ?? "");
+
+    expect(mkdirSync).toHaveBeenCalledWith(stateDir, { recursive: true });
+    expect(unit).toContain(`Environment=PORTLESS_STATE_DIR="${systemdStateDir}"`);
+    expect(unit).toContain(`"--cert" "${systemdCertPath}" "--key" "${systemdKeyPath}"`);
+  });
+
+  it("prints installed service config from a Linux unit", async () => {
+    setPlatform("linux");
+    setGetuid(0);
+    const installedSpec = buildServiceSpec({
+      platform: "linux",
+      nodePath: process.execPath,
+      entryScript: "/fake/cli.js",
+      userHome: "/home/alice",
+      installConfig: {
+        stateDir: "/srv/portless",
+        proxyPort: 8443,
+        useHttps: false,
+        lanMode: true,
+        lanIp: "192.168.1.42",
+        lanIpExplicit: true,
+        useWildcard: true,
+      },
+    });
+    if (installedSpec.platform !== "linux") throw new Error("Expected Linux service spec");
+
+    vi.mocked(existsSync).mockImplementation((file) => file === installedSpec.unitPath);
+    vi.mocked(readFileSync).mockImplementation((file) => {
+      if (file === installedSpec.unitPath) return installedSpec.unit;
+      return "";
+    });
+    const runner = vi.fn((command: string, args: string[]) => {
+      if (command === "systemctl" && args[0] === "is-enabled") {
+        return { status: 0, stdout: "enabled\n", stderr: "" };
+      }
+      if (command === "systemctl" && args[0] === "is-active") {
+        return { status: 1, stdout: "inactive\n", stderr: "" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+
+    await handleService(["service", "status"], {
+      entryScript: "/fake/cli.js",
+      runner,
+    });
+
+    const output = logSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
+    expect(output).toContain("Proxy on 8443");
+    expect(output).toContain("HTTPS: no");
+    expect(output).toContain("TLD: local");
+    expect(output).toContain("LAN mode: yes");
+    expect(output).toContain("LAN IP: 192.168.1.42");
+    expect(output).toContain("Wildcard: yes");
+    expect(output).toContain("State directory: /srv/portless");
   });
 });
