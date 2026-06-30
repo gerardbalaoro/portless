@@ -1169,6 +1169,68 @@ describe("CLI", () => {
         fs.rmSync(shimDir, { recursive: true, force: true });
       }
     });
+
+    it("registers one app route per configured TLD", async () => {
+      const server = http.createServer((_req, res) => {
+        res.setHeader("X-Portless", "1");
+        res.end("ok");
+      });
+
+      try {
+        const proxyPort = await new Promise<number>((resolve) => {
+          server.listen(0, "127.0.0.1", () => {
+            const addr = server.address();
+            if (addr && typeof addr !== "string") {
+              resolve(addr.port);
+            }
+          });
+        });
+
+        fs.writeFileSync(path.join(tmpDir, "proxy.port"), proxyPort.toString());
+        fs.writeFileSync(path.join(tmpDir, "proxy.tlds"), "localhost\ntest\n");
+
+        const capturePath = path.join(tmpDir, "multi-tld-capture.json");
+        const scriptPath = path.join(tmpDir, "capture-routes.js");
+        fs.writeFileSync(
+          scriptPath,
+          [
+            'const fs = require("node:fs");',
+            `const routes = JSON.parse(fs.readFileSync(${JSON.stringify(
+              path.join(tmpDir, "routes.json")
+            )}, "utf-8"));`,
+            `fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({`,
+            "  PORTLESS_URL: process.env.PORTLESS_URL,",
+            "  __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: process.env.__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS,",
+            "  routes,",
+            "}));",
+          ].join("\n") + "\n"
+        );
+
+        const { status } = run(["run", "--name", "myapp", "node", scriptPath], {
+          env: {
+            PORTLESS_STATE_DIR: tmpDir,
+            PORTLESS_HTTPS: "0",
+          },
+        });
+
+        expect(status).toBe(0);
+        const capture = JSON.parse(fs.readFileSync(capturePath, "utf-8")) as {
+          PORTLESS_URL: string;
+          __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: string;
+          routes: Array<{ hostname: string; port: number }>;
+        };
+
+        expect(capture.PORTLESS_URL).toBe(`http://myapp.localhost:${proxyPort}`);
+        expect(capture.__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS).toBe(".localhost,.test");
+        expect(capture.routes.map((route) => route.hostname).sort()).toEqual([
+          "myapp.localhost",
+          "myapp.test",
+        ]);
+        expect(new Set(capture.routes.map((route) => route.port)).size).toBe(1);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
   });
 
   describe("NODE_EXTRA_CA_CERTS injection", () => {

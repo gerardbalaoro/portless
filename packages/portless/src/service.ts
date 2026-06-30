@@ -10,7 +10,7 @@ import {
   discoverState,
   getProtocolPort,
   isProxyRunning,
-  validateTld,
+  parseTldList,
 } from "./cli-utils.js";
 import { isMdnsSupported } from "./mdns.js";
 import { fixOwnership } from "./utils.js";
@@ -23,6 +23,18 @@ const INTERNAL_ELEVATED_ENV = "PORTLESS_INTERNAL_SERVICE_ELEVATED";
 const SERVICE_ENV_KEYS = new Set(["PORTLESS_SYNC_HOSTS"]);
 
 type SupportedPlatform = "darwin" | "linux" | "win32";
+
+function normalizeTlds(tlds: readonly string[]): string[] {
+  return [...new Set(tlds.length > 0 ? tlds : [DEFAULT_TLD])];
+}
+
+function primaryTld(tlds: readonly string[]): string {
+  return tlds[0] ?? DEFAULT_TLD;
+}
+
+function formatTldList(tlds: readonly string[]): string {
+  return tlds.map((tld) => `.${tld}`).join(", ");
+}
 
 type CommandRunner = (
   command: string,
@@ -63,6 +75,7 @@ export type ServiceInstallConfig = {
   lanIp: string | null;
   lanIpExplicit: boolean;
   tld: string;
+  tlds: string[];
   useWildcard: boolean;
   extraEnv: Record<string, string>;
 };
@@ -80,6 +93,7 @@ const DEFAULT_SERVICE_CONFIG: ServiceInstallConfig = {
   lanIp: null,
   lanIpExplicit: false,
   tld: DEFAULT_TLD,
+  tlds: [DEFAULT_TLD],
   useWildcard: false,
   extraEnv: {},
 };
@@ -254,10 +268,8 @@ function parseServiceInstallConfig(
   }
 
   if (env.PORTLESS_TLD) {
-    const tld = env.PORTLESS_TLD.trim().toLowerCase();
-    const err = validateTld(tld);
-    if (err) throw new Error(`PORTLESS_TLD: ${err}`);
-    config.tld = tld;
+    config.tlds = normalizeTlds(parseTldList(env.PORTLESS_TLD, "PORTLESS_TLD"));
+    config.tld = primaryTld(config.tlds);
   }
 
   const envWildcard = parseBooleanEnv(env.PORTLESS_WILDCARD);
@@ -272,6 +284,7 @@ function parseServiceInstallConfig(
   }
 
   const tokens = args[0] === "service" ? args.slice(2) : args;
+  let tldFlagSeen = false;
   for (let i = 0; i < tokens.length; i += 1) {
     const token = tokens[i];
     switch (token) {
@@ -296,10 +309,10 @@ function parseServiceInstallConfig(
         i += 1;
         break;
       case "--tld": {
-        const tld = getFlagValue(tokens, i, token).trim().toLowerCase();
-        const err = validateTld(tld);
-        if (err) throw new Error(err);
-        config.tld = tld;
+        const tlds = parseTldList(getFlagValue(tokens, i, token));
+        config.tlds = normalizeTlds([...(tldFlagSeen ? config.tlds : []), ...tlds]);
+        config.tld = primaryTld(config.tlds);
+        tldFlagSeen = true;
         i += 1;
         break;
       }
@@ -345,6 +358,9 @@ function parseServiceInstallConfig(
   if (!config.lanMode) {
     config.lanIp = null;
     config.lanIpExplicit = false;
+  } else {
+    config.tlds = ["local"];
+    config.tld = "local";
   }
 
   return config;
@@ -403,6 +419,7 @@ function buildProxyCommand(entryScript: string, serviceConfig: ServiceInstallCon
     lanIp: serviceConfig.lanIp,
     lanIpExplicit: serviceConfig.lanIpExplicit,
     tld: serviceConfig.tld,
+    tlds: serviceConfig.tlds,
     useWildcard: serviceConfig.useWildcard,
     foreground: true,
     includePort: true,
@@ -428,8 +445,8 @@ function buildServiceEnv(ctx: ServiceContext): Record<string, string> {
 
   if (ctx.config.lanMode) {
     env.PORTLESS_TLD = "local";
-  } else if (ctx.config.tld !== DEFAULT_TLD) {
-    env.PORTLESS_TLD = ctx.config.tld;
+  } else if (ctx.config.tlds.length > 1 || ctx.config.tld !== DEFAULT_TLD) {
+    env.PORTLESS_TLD = ctx.config.tlds.join(",");
   }
 
   if (ctx.platform === "win32") {
@@ -540,6 +557,13 @@ export function buildServiceSpec(options: {
     ...options.installConfig,
     extraEnv: options.installConfig?.extraEnv ?? {},
   };
+  installConfig.tlds = installConfig.lanMode
+    ? ["local"]
+    : normalizeTlds(
+        options.installConfig?.tlds ??
+          (options.installConfig?.tld ? [options.installConfig.tld] : installConfig.tlds)
+      );
+  installConfig.tld = primaryTld(installConfig.tlds);
   const stateDir =
     options.stateDir ||
     installConfig.stateDir ||
@@ -1148,7 +1172,7 @@ async function printServiceStatus(entryScript: string, runner: CommandRunner): P
     `  Proxy on ${config.proxyPort}: ${status.proxyRunning ? "responding" : "not responding"}`
   );
   console.log(`  HTTPS: ${config.useHttps ? "yes" : "no"}`);
-  console.log(`  TLD: ${config.lanMode ? "local" : config.tld}`);
+  console.log(`  TLDs: ${config.lanMode ? ".local" : formatTldList(config.tlds)}`);
   console.log(`  LAN mode: ${config.lanMode ? "yes" : "no"}`);
   if (config.lanIpExplicit && config.lanIp) {
     console.log(`  LAN IP: ${config.lanIp}`);
@@ -1177,7 +1201,7 @@ ${colors.bold("Install options:")}
   --https                          Enable HTTPS
   --lan                            Enable LAN mode
   --ip <address>                   Pin a specific LAN IP
-  --tld <tld>                      Use a custom TLD outside LAN mode
+  --tld <tld>                      Use a custom TLD outside LAN mode, repeatable
   --wildcard                       Allow subdomain fallback
   --cert <path>                    Use a custom TLS certificate
   --key <path>                     Use a custom TLS private key

@@ -118,3 +118,26 @@ export function parseHostname(input: string, tld = "localhost"): string {
 
   return hostname;
 }
+
+/**
+ * Parse a hostname input for every configured TLD. If the input already ends
+ * with one of those TLDs, use the stripped base name for the full set.
+ */
+export function parseHostnames(input: string, tlds: readonly string[] = ["localhost"]): string[] {
+  const uniqueTlds = [...new Set(tlds)];
+  let baseInput = input
+    .trim()
+    .replace(/^https?:\/\//, "")
+    .split("/")[0]
+    .toLowerCase();
+
+  for (const tld of uniqueTlds) {
+    const suffix = `.${tld}`;
+    if (baseInput.endsWith(suffix)) {
+      baseInput = baseInput.slice(0, -suffix.length);
+      break;
+    }
+  }
+
+  return uniqueTlds.map((tld) => parseHostname(baseInput, tld));
+}

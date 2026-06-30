@@ -750,13 +750,14 @@ export function createSNICallback(
   stateDir: string,
   defaultCert: Buffer,
   defaultKey: Buffer,
-  tld = "localhost",
+  tlds: string | readonly string[] = "localhost",
   caCert?: Buffer
 ): (servername: string, cb: (err: Error | null, ctx?: tls.SecureContext) => void) => void {
   const cache = new Map<string, tls.SecureContext>();
   const pending = new Map<string, Promise<tls.SecureContext>>();
+  const configuredTlds = Array.isArray(tlds) ? tlds : [tlds];
 
-  // Pre-cache the default context for the bare TLD itself.
+  // Pre-cache the default context for the built-in localhost certificate.
   // Include the CA certificate so clients receive the full chain.
   const defaultCtx = tls.createSecureContext({
     cert: caCert ? Buffer.concat([defaultCert, caCert]) : defaultCert,
@@ -764,12 +765,12 @@ export function createSNICallback(
   });
 
   return (servername: string, cb: (err: Error | null, ctx?: tls.SecureContext) => void) => {
-    // The bare TLD (e.g. "localhost" or "test") uses the default cert.
+    // The bare localhost name uses the default cert.
     // All subdomains need a cert with an exact SAN entry.
     // For .localhost: RFC 2606 §2 designates it as a reserved TLD, so
     // "*.localhost" sits at the public-suffix boundary and TLS specs do
     // not permit wildcard certificates at that level.
-    if (servername === tld) {
+    if (servername === "localhost" && configuredTlds.includes("localhost")) {
       cb(null, defaultCtx);
       return;
     }

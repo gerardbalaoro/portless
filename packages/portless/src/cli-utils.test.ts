@@ -18,18 +18,22 @@ import {
   findFreePort,
   getDefaultPort,
   getDefaultTld,
+  getDefaultTlds,
   getProtocolPort,
   isHttpsEnvDisabled,
   injectFrameworkFlags,
   isProxyRunning,
   parsePidFromNetstat,
+  parseTldList,
   readLanMarker,
   readPersistedProxyState,
   readTldFromDir,
+  readTldsFromDir,
   resolveStateDir,
   validateTld,
   writeLanMarker,
   writeTldFile,
+  writeTldsFile,
   writeTlsMarker,
 } from "./cli-utils.js";
 
@@ -761,6 +765,52 @@ describe("getDefaultTld", () => {
     process.env.PORTLESS_TLD = "";
     expect(getDefaultTld()).toBe(DEFAULT_TLD);
   });
+
+  it("returns the first TLD when PORTLESS_TLD contains a list", () => {
+    process.env.PORTLESS_TLD = "localhost,test";
+    expect(getDefaultTld()).toBe("localhost");
+  });
+});
+
+describe("getDefaultTlds", () => {
+  let originalEnv: string | undefined;
+
+  beforeEach(() => {
+    originalEnv = process.env.PORTLESS_TLD;
+  });
+
+  afterEach(() => {
+    if (originalEnv === undefined) {
+      delete process.env.PORTLESS_TLD;
+    } else {
+      process.env.PORTLESS_TLD = originalEnv;
+    }
+  });
+
+  it("returns DEFAULT_TLD when PORTLESS_TLD is not set", () => {
+    delete process.env.PORTLESS_TLD;
+    expect(getDefaultTlds()).toEqual([DEFAULT_TLD]);
+  });
+
+  it("parses comma separated values", () => {
+    process.env.PORTLESS_TLD = "localhost, test";
+    expect(getDefaultTlds()).toEqual(["localhost", "test"]);
+  });
+
+  it("deduplicates values in order", () => {
+    process.env.PORTLESS_TLD = "test,localhost,test";
+    expect(getDefaultTlds()).toEqual(["test", "localhost"]);
+  });
+});
+
+describe("parseTldList", () => {
+  it("parses and normalizes values", () => {
+    expect(parseTldList(" TEST,localhost ")).toEqual(["test", "localhost"]);
+  });
+
+  it("rejects empty list entries", () => {
+    expect(() => parseTldList("test,")).toThrow("TLD cannot be empty");
+  });
 });
 
 describe("buildProxyStartConfig", () => {
@@ -779,6 +829,7 @@ describe("buildProxyStartConfig", () => {
       })
     ).toEqual({
       effectiveTld: "local",
+      effectiveTlds: ["local"],
       args: [
         "--foreground",
         "--port",
@@ -803,6 +854,7 @@ describe("buildProxyStartConfig", () => {
       })
     ).toEqual({
       effectiveTld: "local",
+      effectiveTlds: ["local"],
       args: ["--no-tls", "--lan", INTERNAL_LAN_IP_FLAG, "192.168.1.42"],
     });
   });
@@ -816,7 +868,23 @@ describe("buildProxyStartConfig", () => {
       })
     ).toEqual({
       effectiveTld: "test",
+      effectiveTlds: ["test"],
       args: ["--no-tls", "--tld", "test"],
+    });
+  });
+
+  it("emits each TLD outside LAN mode", () => {
+    expect(
+      buildProxyStartConfig({
+        useHttps: true,
+        lanMode: false,
+        tld: "localhost",
+        tlds: ["localhost", "test"],
+      })
+    ).toEqual({
+      effectiveTld: "localhost",
+      effectiveTlds: ["localhost", "test"],
+      args: ["--https", "--tld", "localhost", "--tld", "test"],
     });
   });
 });
@@ -884,11 +952,20 @@ describe("readTldFromDir / writeTldFile", () => {
 
   it("returns DEFAULT_TLD when file does not exist", () => {
     expect(readTldFromDir(tmpDir)).toBe(DEFAULT_TLD);
+    expect(readTldsFromDir(tmpDir)).toEqual([DEFAULT_TLD]);
   });
 
   it("writes and reads a custom TLD", () => {
     writeTldFile(tmpDir, "test");
     expect(readTldFromDir(tmpDir)).toBe("test");
+    expect(readTldsFromDir(tmpDir)).toEqual(["test"]);
+  });
+
+  it("writes and reads multiple TLDs", () => {
+    writeTldsFile(tmpDir, ["localhost", "test"]);
+    expect(readTldFromDir(tmpDir)).toBe("localhost");
+    expect(readTldsFromDir(tmpDir)).toEqual(["localhost", "test"]);
+    expect(fs.readFileSync(path.join(tmpDir, "proxy.tld"), "utf-8")).toBe("localhost");
   });
 
   it("removes the file when writing the default TLD", () => {
@@ -897,6 +974,7 @@ describe("readTldFromDir / writeTldFile", () => {
 
     writeTldFile(tmpDir, DEFAULT_TLD);
     expect(fs.existsSync(path.join(tmpDir, "proxy.tld"))).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, "proxy.tlds"))).toBe(false);
     expect(readTldFromDir(tmpDir)).toBe(DEFAULT_TLD);
   });
 
@@ -983,6 +1061,16 @@ describe("readPersistedProxyState", () => {
     const state = readPersistedProxyState();
     expect(state).not.toBeNull();
     expect(state!.tld).toBe("test");
+    expect(state!.tlds).toEqual(["test"]);
+  });
+
+  it("reads TLD list from persisted state", () => {
+    fs.writeFileSync(path.join(tmpDir, "proxy.port"), "1355");
+    writeTldsFile(tmpDir, ["localhost", "test"]);
+    const state = readPersistedProxyState();
+    expect(state).not.toBeNull();
+    expect(state!.tld).toBe("localhost");
+    expect(state!.tlds).toEqual(["localhost", "test"]);
   });
 
   it("reads LAN mode from persisted state", () => {
@@ -1003,6 +1091,7 @@ describe("readPersistedProxyState", () => {
       port: 1355,
       tls: true,
       tld: "local",
+      tlds: ["local"],
       lanMode: true,
     });
   });

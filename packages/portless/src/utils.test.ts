@@ -1,5 +1,12 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { escapeHtml, formatUrl, isErrnoException, isProcessAlive, parseHostname } from "./utils.js";
+import {
+  escapeHtml,
+  formatUrl,
+  isErrnoException,
+  isProcessAlive,
+  parseHostname,
+  parseHostnames,
+} from "./utils.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -232,5 +239,25 @@ describe("parseHostname", () => {
     it("works with dev TLD", () => {
       expect(parseHostname("myapp", "dev")).toBe("myapp.dev");
     });
+  });
+});
+
+describe("parseHostnames", () => {
+  it("builds one hostname per TLD", () => {
+    expect(parseHostnames("myapp", ["localhost", "test"])).toEqual([
+      "myapp.localhost",
+      "myapp.test",
+    ]);
+  });
+
+  it("strips an active TLD before building all hostnames", () => {
+    expect(parseHostnames("api.myapp.test", ["localhost", "test"])).toEqual([
+      "api.myapp.localhost",
+      "api.myapp.test",
+    ]);
+  });
+
+  it("deduplicates TLDs", () => {
+    expect(parseHostnames("myapp", ["test", "test"])).toEqual(["myapp.test"]);
   });
 });

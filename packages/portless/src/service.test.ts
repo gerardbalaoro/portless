@@ -484,6 +484,7 @@ describe("handleService", () => {
       port: currentPort,
       tls: true,
       tld: "localhost",
+      tlds: ["localhost"],
       lanMode: false,
       lanIp: null,
     });
@@ -631,7 +632,7 @@ describe("handleService", () => {
     const output = logSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
     expect(output).toContain("Proxy on 8443");
     expect(output).toContain("HTTPS: no");
-    expect(output).toContain("TLD: local");
+    expect(output).toContain("TLDs: .local");
     expect(output).toContain("LAN mode: yes");
     expect(output).toContain("LAN IP: 192.168.1.42");
     expect(output).toContain("Wildcard: yes");

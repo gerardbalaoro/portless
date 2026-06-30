@@ -114,11 +114,13 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     getRoutes,
     proxyPort,
     tld = "localhost",
+    tlds = [tld],
     strict = true,
     onError = (msg: string) => console.error(msg),
     tls,
   } = options;
-  const tldSuffix = `.${tld}`;
+  const tldSuffixes = [...new Set(tlds.length > 0 ? tlds : [tld])].map((value) => `.${value}`);
+  const primaryTldSuffix = tldSuffixes[0] ?? ".localhost";
 
   const handleRequest = (req: http.IncomingMessage, res: http.ServerResponse) => {
     const reqTls = isEncrypted(req);
@@ -147,7 +149,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
           "Loop Detected",
           `<div class="content"><p class="desc">This request has passed through portless ${hops} times. This usually means a dev server (Vite, webpack, etc.) is proxying requests back through portless without rewriting the Host header.</p><div class="section"><p class="label">Fix: add changeOrigin to your proxy config</p><pre class="terminal">proxy: {
   "/api": {
-    target: "${reqTls ? "https" : "http"}://&lt;backend&gt;${escapeHtml(tldSuffix)}${reqTls ? "" : ":&lt;port&gt;"}",
+    target: "${reqTls ? "https" : "http"}://&lt;backend&gt;${escapeHtml(primaryTldSuffix)}${reqTls ? "" : ":&lt;port&gt;"}",
     changeOrigin: true,
   },
 }</pre></div></div>`
@@ -160,7 +162,8 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     if (!route) {
       const safeHost = escapeHtml(host);
-      const strippedHost = host.endsWith(tldSuffix) ? host.slice(0, -tldSuffix.length) : host;
+      const matchedSuffix = tldSuffixes.find((suffix) => host.endsWith(suffix));
+      const strippedHost = matchedSuffix ? host.slice(0, -matchedSuffix.length) : host;
       const safeSuggestion = escapeHtml(strippedHost);
       const routesList =
         routes.length > 0
