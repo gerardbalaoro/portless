@@ -13,6 +13,7 @@ import {
   parseTldList,
 } from "./cli-utils.js";
 import { isMdnsSupported } from "./mdns.js";
+import { writeJson, writeJsonError } from "./json-output.js";
 import { fixOwnership, resolveUserHome } from "./utils.js";
 
 const DEFAULT_SERVICE_PORT = getProtocolPort(true);
@@ -134,6 +135,7 @@ export type ServiceSpec =
     };
 
 type ServiceStatus = {
+  platform: SupportedPlatform;
   installed: boolean;
   managerState: string;
   proxyRunning: boolean;
@@ -1122,7 +1124,8 @@ export function tryUninstallService(
 
 async function getServiceStatus(
   entryScript: string,
-  runner: CommandRunner
+  runner: CommandRunner,
+  strict = false
 ): Promise<ServiceStatus> {
   const spec = currentServiceSpec(entryScript);
   const installedConfig = readInstalledServiceConfig(spec) ?? spec.config;
@@ -1131,6 +1134,7 @@ async function getServiceStatus(
   if (spec.platform === "darwin") {
     const installed = fs.existsSync(spec.plistPath);
     const result = runner("launchctl", ["print", `system/${spec.label}`]);
+    if (strict && result.error) throw result.error;
     const output = `${result.stdout || ""}${result.stderr || ""}`;
     const managerState =
       result.status === 0 && /state = running|pid = \d+/.test(output)
@@ -1139,6 +1143,7 @@ async function getServiceStatus(
           ? "installed"
           : "not installed";
     return {
+      platform: spec.platform,
       installed,
       managerState,
       proxyRunning,
@@ -1149,10 +1154,13 @@ async function getServiceStatus(
 
   if (spec.platform === "linux") {
     const enabled = runner("systemctl", ["is-enabled", spec.serviceName]);
+    if (strict && enabled.error) throw enabled.error;
     const active = runner("systemctl", ["is-active", spec.serviceName]);
+    if (strict && active.error) throw active.error;
     const installed = enabled.status === 0 || active.status === 0 || fs.existsSync(spec.unitPath);
     const activeText = (active.stdout || "").trim();
     return {
+      platform: spec.platform,
       installed,
       managerState:
         active.status === 0 ? activeText || "active" : installed ? "installed" : "not installed",
@@ -1163,10 +1171,12 @@ async function getServiceStatus(
   }
 
   const query = runner("schtasks", spec.queryArgs);
+  if (strict && query.error) throw query.error;
   const output = `${query.stdout || ""}${query.stderr || ""}`;
   const installed = query.status === 0;
   const stateMatch = output.match(/^\s*Status:\s*(.+)$/im);
   return {
+    platform: spec.platform,
     installed,
     managerState: installed ? stateMatch?.[1]?.trim() || "installed" : "not installed",
     proxyRunning,
@@ -1175,9 +1185,32 @@ async function getServiceStatus(
   };
 }
 
-async function printServiceStatus(entryScript: string, runner: CommandRunner): Promise<void> {
-  const status = await getServiceStatus(entryScript, runner);
+async function printServiceStatus(
+  entryScript: string,
+  runner: CommandRunner,
+  json: boolean
+): Promise<void> {
+  const status = await getServiceStatus(entryScript, runner, json);
   const config = status.config;
+  if (json) {
+    writeJson("service status", {
+      installed: status.installed,
+      managerState: status.managerState,
+      proxyRunning: status.proxyRunning,
+      platform: status.platform,
+      config: {
+        proxyPort: config.proxyPort,
+        useHttps: config.useHttps,
+        tlds: config.tlds,
+        lanMode: config.lanMode,
+        lanIp: config.lanIp,
+        useWildcard: config.useWildcard,
+        stateDir: config.stateDir,
+      },
+      serviceEntry: status.details ?? null,
+    });
+    return;
+  }
   console.log(colors.bold("portless service"));
   console.log(`  Manager state: ${status.managerState}`);
   console.log(`  Installed: ${status.installed ? "yes" : "no"}`);
@@ -1220,6 +1253,9 @@ ${colors.bold("Install options:")}
   --key <path>                     Use a custom TLS private key
   --state-dir <path>               Use a custom service state directory
 
+${colors.bold("Status options:")}
+  --json                           Output machine-readable JSON
+
 ${colors.bold("Notes:")}
   The service uses the default clean URL mode unless options or PORTLESS_*
   environment variables are provided during install.
@@ -1230,9 +1266,10 @@ ${colors.bold("Notes:")}
 
 export async function handleService(
   args: string[],
-  options: { entryScript: string; runner?: CommandRunner }
+  options: { entryScript: string; runner?: CommandRunner; json?: boolean }
 ): Promise<void> {
   const action = args[1];
+  const json = options.json ?? false;
   const runner = options.runner || defaultRunner;
 
   if (!action || action === "--help" || action === "-h") {
@@ -1250,7 +1287,7 @@ export async function handleService(
       return;
     }
     if (action === "status") {
-      await printServiceStatus(options.entryScript, runner);
+      await printServiceStatus(options.entryScript, runner, json);
       return;
     }
 
@@ -1259,7 +1296,11 @@ export async function handleService(
     process.exit(1);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(colors.red("Error:"), message);
+    if (json) {
+      writeJsonError("service status", message);
+    } else {
+      console.error(colors.red("Error:"), message);
+    }
     process.exit(1);
   }
 }

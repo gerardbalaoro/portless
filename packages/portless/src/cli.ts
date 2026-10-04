@@ -129,6 +129,8 @@ import {
 } from "./turbo.js";
 import type { ManifestEntry } from "./turbo.js";
 import { buildServiceUninstallSudoArgs, handleService, tryUninstallService } from "./service.js";
+import { JsonArgumentError, writeJson, writeJsonError } from "./json-output.js";
+import type { JsonCommand } from "./json-output.js";
 
 const chalk = colors;
 
@@ -2278,15 +2280,47 @@ ${colors.bold("Options:")}
   );
 }
 
-async function handleList(): Promise<void> {
+async function handleList(args: string[], json = false): Promise<void> {
+  if (json && args[1] === "--help") {
+    console.log(`
+${colors.bold("portless list")} - Show active routes and their assigned ports.
+
+${colors.bold("Usage:")}
+  ${colors.cyan("portless list")}
+
+${colors.bold("Options:")}
+  --json                 Print structured JSON instead of text
+  --help, -h             Show this help
+`);
+    return;
+  }
   const { dir, port, tls } = await discoverState();
+  const warnings: string[] = [];
   const store = new RouteStore(dir, {
-    onWarning: (msg) => console.warn(colors.yellow(msg)),
+    onWarning: (msg) => (json ? warnings.push(msg) : console.warn(colors.yellow(msg))),
   });
+  if (json) {
+    const routes = store.loadRoutes().map((route) => ({
+      hostname: route.hostname,
+      url: formatUrl(route.hostname, port, tls),
+      port: route.port,
+      pid: route.pid,
+      alias: route.pid === 0,
+      ...(route.tailscaleUrl !== undefined && { tailscaleUrl: route.tailscaleUrl }),
+      ...(route.tailscaleHttpsPort !== undefined && {
+        tailscaleHttpsPort: route.tailscaleHttpsPort,
+      }),
+      ...(route.tailscaleFunnel !== undefined && { tailscaleFunnel: route.tailscaleFunnel }),
+      ...(route.ngrokUrl !== undefined && { ngrokUrl: route.ngrokUrl }),
+      ...(route.ngrokPid !== undefined && { ngrokPid: route.ngrokPid }),
+    }));
+    writeJson("list", { proxy: { port, tls, stateDir: dir }, routes, warnings });
+    return;
+  }
   listRoutes(store, port, tls);
 }
 
-async function handleGet(args: string[]): Promise<void> {
+async function handleGet(args: string[], json = false): Promise<void> {
   if (args[1] === "--help" || args[1] === "-h") {
     console.log(`
 ${colors.bold("portless get")} - Print the URL for a service.
@@ -2302,6 +2336,7 @@ together:
 
 ${colors.bold("Options:")}
   --no-worktree          Skip worktree prefix detection
+  --json                 Print structured JSON instead of a bare URL
   --help, -h             Show this help
 
 ${colors.bold("Examples:")}
@@ -2313,14 +2348,18 @@ ${colors.bold("Examples:")}
   }
 
   let skipWorktree = false;
+  let endOfOptions = false;
   const positional: string[] = [];
 
   for (let i = 1; i < args.length; i++) {
-    if (args[i] === "--no-worktree") {
+    if (json && !endOfOptions && args[i] === "--") {
+      endOfOptions = true;
+    } else if (!endOfOptions && args[i] === "--no-worktree") {
       skipWorktree = true;
-    } else if (args[i].startsWith("-")) {
+    } else if (!endOfOptions && args[i].startsWith("-")) {
+      if (json) throw new JsonArgumentError(`Unknown flag "${args[i]}".`);
       console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
-      console.error(colors.blue("Known flags: --no-worktree, --help"));
+      console.error(colors.blue("Known flags: --no-worktree, --json, --help"));
       process.exit(1);
     } else {
       positional.push(args[i]);
@@ -2328,6 +2367,7 @@ ${colors.bold("Examples:")}
   }
 
   if (positional.length === 0) {
+    if (json) throw new JsonArgumentError("Missing service name.");
     console.error(colors.red("Error: Missing service name."));
     console.error(colors.blue("Usage:"));
     console.error(colors.cyan("  portless get <name>"));
@@ -2336,13 +2376,26 @@ ${colors.bold("Examples:")}
     process.exit(1);
   }
 
+  if (json && positional.length > 1) {
+    throw new JsonArgumentError(`Unexpected argument "${positional[1]}".`);
+  }
+
   const name = positional[0];
   const worktree = skipWorktree ? null : detectWorktreePrefix();
   const effectiveName = worktree ? `${worktree.prefix}.${name}` : name;
 
   const { port, tls, tlds } = await discoverState();
-  const hostname = buildHostnames(effectiveName, tlds)[0]!;
+  let hostname: string;
+  try {
+    hostname = buildHostnames(effectiveName, tlds)[0]!;
+  } catch (err) {
+    throw new JsonArgumentError(err instanceof Error ? err.message : String(err));
+  }
   const url = formatUrl(hostname, port, tls);
+  if (json) {
+    writeJson("get", { name, hostname, url, proxy: { port, tls }, worktree });
+    return;
+  }
   // Print bare URL to stdout so it works in $(portless get <name>)
   process.stdout.write(url + "\n");
 }
@@ -2531,9 +2584,34 @@ ${colors.bold("Usage: portless hosts <command>")}
 type DoctorStatus = "ok" | "warn" | "fail" | "info";
 
 type DoctorFinding = {
+  code: string;
   status: DoctorStatus;
   message: string;
   hint?: string;
+  details?: Record<string, unknown>;
+};
+
+type DoctorReport = {
+  recordedLanMode: boolean;
+  metadata: {
+    version: string;
+    nodeVersion: string;
+    platform: string;
+    arch: string;
+    stateDir: string;
+    proxy: {
+      url: string;
+      port: number;
+      tls: boolean;
+      running: boolean;
+      portListening: boolean;
+      customCertificate: boolean;
+    };
+    tlds: string[];
+    lan: { enabled: boolean; ip: string | null };
+  };
+  findings: DoctorFinding[];
+  summary: { failures: number; warnings: number };
 };
 
 function colorDoctorStatus(status: DoctorStatus): (value: string) => string {
@@ -2599,7 +2677,7 @@ function doctorProxyStartHint(proxyPort: number, tls: boolean): string {
   return `Run: portless proxy start${portArgs}${tlsArgs}`;
 }
 
-async function handleDoctor(args: string[]): Promise<void> {
+async function handleDoctor(args: string[], json = false): Promise<void> {
   if (args[1] === "--help" || args[1] === "-h") {
     console.log(`
 ${colors.bold("portless doctor")} - Check local portless health and print suggested fixes.
@@ -2612,6 +2690,7 @@ trust, hostname resolution, and LAN mode prerequisites. It does not start,
 stop, clean, prune, trust, or modify portless state.
 
 ${colors.bold("Options:")}
+  --json                 Print a versioned JSON health report
   --help, -h             Show this help
 `);
     process.exit(0);
@@ -2623,9 +2702,32 @@ ${colors.bold("Options:")}
     process.exit(1);
   }
 
+  const report = await collectDoctorReport();
+  if (json) {
+    const { metadata, findings, summary } = report;
+    writeJson("doctor", { metadata, findings, summary });
+  } else {
+    printDoctorReport(report);
+  }
+  if (report.summary.failures > 0) process.exitCode = 1;
+}
+
+async function collectDoctorReport(): Promise<DoctorReport> {
   const findings: DoctorFinding[] = [];
-  const add = (status: DoctorStatus, message: string, hint?: string) => {
-    findings.push({ status, message, hint });
+  const add = (
+    code: string,
+    status: DoctorStatus,
+    message: string,
+    hint?: string,
+    details?: Record<string, unknown>
+  ) => {
+    findings.push({
+      code,
+      status,
+      message,
+      ...(hint ? { hint } : {}),
+      ...(details ? { details } : {}),
+    });
   };
 
   let state: Awaited<ReturnType<typeof discoverState>>;
@@ -2633,7 +2735,7 @@ ${colors.bold("Options:")}
     state = await discoverState();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    add("fail", `Could not discover portless state: ${message}`);
+    add("state.discovery_failed", "fail", `Could not discover portless state: ${message}`);
     state = {
       dir: resolveStateDir(),
       port: getDefaultPort(!isHttpsEnvDisabled()),
@@ -2646,7 +2748,10 @@ ${colors.bold("Options:")}
   }
 
   const store = new RouteStore(state.dir, {
-    onWarning: (msg) => add("warn", msg),
+    onWarning: (msg) =>
+      add("routes.read_warning", "warn", msg, undefined, {
+        path: path.join(state.dir, "routes.json"),
+      }),
   });
   const hasPortFile = fs.existsSync(store.portFilePath);
   const configuredTls = hasPortFile ? state.tls : !isHttpsEnvDisabled();
@@ -2665,71 +2770,92 @@ ${colors.bold("Options:")}
   const proxyUsesCustomCert = proxyTls && readCustomCertMarker(state.dir);
   const stateExists = fs.existsSync(state.dir);
 
-  console.log(colors.blue.bold("\nportless doctor\n"));
-  console.log(`Version: ${__VERSION__}`);
-  console.log(`Node.js: ${process.versions.node}`);
-  console.log(`Platform: ${process.platform} ${process.arch}`);
-  console.log(`State dir: ${state.dir}`);
-  console.log(`Proxy target: ${formatUrl("127.0.0.1", proxyPort, proxyTls)}`);
-  console.log(
-    `Mode: ${proxyTls ? "HTTPS" : "HTTP"}, ${formatTldList(state.tlds)}${state.lanMode ? ", LAN" : ""}`
-  );
-  console.log("");
-
   const nodeMajor = parseInt(process.versions.node.split(".")[0], 10);
   if (nodeMajor >= 24) {
-    add("ok", `Node.js ${process.versions.node} satisfies portless requirements.`);
+    add(
+      "node.supported",
+      "ok",
+      `Node.js ${process.versions.node} satisfies portless requirements.`
+    );
   } else {
-    add("fail", `Node.js ${process.versions.node} is unsupported.`, "Install Node.js 24 or newer.");
+    add(
+      "node.unsupported",
+      "fail",
+      `Node.js ${process.versions.node} is unsupported.`,
+      "Install Node.js 24 or newer."
+    );
   }
 
   if (stateExists) {
     try {
       const stat = fs.statSync(state.dir);
       if (!stat.isDirectory()) {
-        add("fail", `State path exists but is not a directory: ${state.dir}`);
+        add(
+          "state.not_directory",
+          "fail",
+          `State path exists but is not a directory: ${state.dir}`
+        );
       } else if (checkPathWritable(state.dir)) {
-        add("ok", `State directory is writable: ${state.dir}`);
+        add("state.writable", "ok", `State directory is writable: ${state.dir}`);
       } else {
-        add("fail", `State directory is not writable: ${state.dir}`);
+        add("state.not_writable", "fail", `State directory is not writable: ${state.dir}`);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      add("fail", `Could not inspect state directory: ${message}`);
+      add("state.inspection_failed", "fail", `Could not inspect state directory: ${message}`);
     }
   } else {
     const ancestor = findExistingAncestor(path.dirname(state.dir));
     if (!ancestor) {
       add(
+        "state.no_ancestor",
         "fail",
         `State directory does not exist and no writable ancestor was found: ${state.dir}`
       );
     } else {
       const ancestorStat = fs.statSync(ancestor);
       if (!ancestorStat.isDirectory()) {
-        add("fail", `State directory does not exist and ancestor is not a directory: ${ancestor}`);
+        add(
+          "state.ancestor_not_directory",
+          "fail",
+          `State directory does not exist and ancestor is not a directory: ${ancestor}`,
+          undefined,
+          { path: ancestor }
+        );
       } else if (checkPathWritable(ancestor)) {
-        add("info", `State directory has not been created yet: ${state.dir}`);
+        add("state.not_created", "info", `State directory has not been created yet: ${state.dir}`);
       } else {
-        add("fail", `State directory does not exist and ancestor is not writable: ${ancestor}`);
+        add(
+          "state.ancestor_not_writable",
+          "fail",
+          `State directory does not exist and ancestor is not writable: ${ancestor}`,
+          undefined,
+          { path: ancestor }
+        );
       }
     }
   }
 
   if (proxyRunning) {
-    add("ok", `Proxy is responding on port ${proxyPort}.`);
+    add("proxy.responding", "ok", `Proxy is responding on port ${proxyPort}.`, undefined, {
+      port: proxyPort,
+    });
   } else if (portListening) {
     const pid = findPidOnPort(proxyPort);
     add(
+      "proxy.port_conflict",
       "fail",
       `Port ${proxyPort} is in use, but it is not a portless proxy.`,
-      pid ? `Process on port: PID ${pid}` : "Could not identify the process holding the port."
+      pid ? `Process on port: PID ${pid}` : "Could not identify the process holding the port.",
+      { port: proxyPort, pid }
     );
   } else {
     add(
+      "proxy.not_running",
       "warn",
       `Proxy is not running on port ${proxyPort}.`,
-      doctorProxyStartHint(proxyPort, proxyTls)
+      doctorProxyStartHint(proxyPort, proxyTls),
+      { port: proxyPort }
     );
   }
 
@@ -2738,42 +2864,69 @@ ${colors.bold("Options:")}
       const rawPid = fs.readFileSync(store.pidPath, "utf-8").trim();
       const pid = parseInt(rawPid, 10);
       if (isNaN(pid) || pid <= 0) {
-        add("fail", `Proxy PID file is invalid: ${store.pidPath}`);
+        add("proxy.pid_invalid", "fail", `Proxy PID file is invalid: ${store.pidPath}`, undefined, {
+          path: store.pidPath,
+        });
       } else if (!isProcessAliveForDoctor(pid)) {
-        add("warn", `Proxy PID file is stale: ${pid}`, "Run: portless proxy stop");
+        add(
+          "proxy.pid_stale",
+          "warn",
+          `Proxy PID file is stale: ${pid}`,
+          "Run: portless proxy stop",
+          { pid }
+        );
       } else if (!proxyRunning) {
         add(
+          "proxy.pid_not_responding",
           "warn",
           `Proxy PID file points to PID ${pid}, but no portless proxy is responding on port ${proxyPort}.`,
-          "Run: portless proxy stop"
+          "Run: portless proxy stop",
+          { pid, port: proxyPort }
         );
       } else {
         const portPid = findPidOnPort(proxyPort);
         if (portPid !== null && portPid !== pid) {
           add(
+            "proxy.pid_mismatch",
             "warn",
             `Proxy PID file points to PID ${pid}, but port ${proxyPort} is owned by PID ${portPid}.`,
-            "Run: portless proxy stop"
+            "Run: portless proxy stop",
+            { pid, port: proxyPort, portPid }
           );
         } else {
-          add("ok", `Proxy PID file points to the responding proxy process: ${pid}`);
+          add(
+            "proxy.pid_responding",
+            "ok",
+            `Proxy PID file points to the responding proxy process: ${pid}`,
+            undefined,
+            { pid }
+          );
         }
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      add("fail", `Could not read proxy PID file: ${message}`);
+      add("proxy.pid_read_failed", "fail", `Could not read proxy PID file: ${message}`, undefined, {
+        path: store.pidPath,
+      });
     }
   } else if (proxyRunning) {
-    add("warn", `Proxy is running but the PID file is missing: ${store.pidPath}`);
+    add(
+      "proxy.pid_missing",
+      "warn",
+      `Proxy is running but the PID file is missing: ${store.pidPath}`,
+      undefined,
+      { path: store.pidPath }
+    );
   }
 
   if (proxyUsesCustomCert) {
-    add("ok", "Proxy is configured with a custom TLS certificate.");
+    add("tls.custom_certificate", "ok", "Proxy is configured with a custom TLS certificate.");
   } else if (proxyTls || (!currentProxyStateIsHttp && !isHttpsEnvDisabled())) {
     if (checkCommandAvailable("openssl", ["version"])) {
-      add("ok", "OpenSSL is available for certificate generation.");
+      add("openssl.available", "ok", "OpenSSL is available for certificate generation.");
     } else {
       add(
+        "openssl.unavailable",
         "fail",
         "OpenSSL is not available on PATH.",
         isWindows
@@ -2782,30 +2935,41 @@ ${colors.bold("Options:")}
       );
     }
   } else {
-    add("info", "HTTPS is disabled, so OpenSSL is not required for this run.");
+    add(
+      "openssl.not_required",
+      "info",
+      "HTTPS is disabled, so OpenSSL is not required for this run."
+    );
   }
 
   if (proxyTls && proxyUsesCustomCert) {
-    add("info", "Generated local CA is not required for custom TLS certificates.");
+    add(
+      "ca.not_required",
+      "info",
+      "Generated local CA is not required for custom TLS certificates."
+    );
   } else if (proxyTls) {
     const caPath = path.join(state.dir, "ca.pem");
     if (fs.existsSync(caPath)) {
       if (isCATrusted(state.dir)) {
-        add("ok", "Local CA is trusted by the OS trust store.");
+        add("ca.trusted", "ok", "Local CA is trusted by the OS trust store.");
       } else {
         add(
+          "ca.not_trusted",
           "warn",
           "Local CA exists but is not trusted by the OS trust store.",
           "Run: portless trust"
         );
       }
     } else if (proxyRunning) {
-      add("warn", `Generated CA file is missing: ${caPath}`);
+      add("ca.missing", "warn", `Generated CA file is missing: ${caPath}`, undefined, {
+        path: caPath,
+      });
     } else {
-      add("info", "Local CA has not been generated yet.");
+      add("ca.not_generated", "info", "Local CA has not been generated yet.");
     }
   } else {
-    add("info", "HTTPS is disabled for the current proxy state.");
+    add("tls.disabled", "info", "HTTPS is disabled for the current proxy state.");
   }
 
   let rawRoutes: ReturnType<RouteStore["loadRoutesRaw"]> = [];
@@ -2813,7 +2977,7 @@ ${colors.bold("Options:")}
     rawRoutes = store.loadRoutesRaw();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    add("fail", `Could not read routes: ${message}`);
+    add("routes.read_failed", "fail", `Could not read routes: ${message}`);
   }
 
   const liveRoutes = rawRoutes.filter(
@@ -2823,22 +2987,42 @@ ${colors.bold("Options:")}
     (route) => route.pid !== 0 && !isProcessAliveForDoctor(route.pid)
   );
   if (rawRoutes.length === 0) {
-    add("info", "No routes are registered.");
+    add("routes.empty", "info", "No routes are registered.");
   } else if (staleRoutes.length === 0) {
-    add("ok", `Routes: ${pluralize(liveRoutes.length, "active route")}.`);
+    add(
+      "routes.active",
+      "ok",
+      `Routes: ${pluralize(liveRoutes.length, "active route")}.`,
+      undefined,
+      { active: liveRoutes.length, stale: 0 }
+    );
   } else {
     add(
+      "routes.stale",
       "warn",
       `Routes: ${pluralize(liveRoutes.length, "active route")}, ${pluralize(staleRoutes.length, "stale route")}.`,
-      "Run: portless prune"
+      "Run: portless prune",
+      { active: liveRoutes.length, stale: staleRoutes.length }
     );
   }
 
   for (const route of staleRoutes.slice(0, 5)) {
-    add("warn", `Stale route ${route.hostname} is owned by exited PID ${route.pid}.`);
+    add(
+      "route.stale",
+      "warn",
+      `Stale route ${route.hostname} is owned by exited PID ${route.pid}.`,
+      undefined,
+      { hostname: route.hostname, port: route.port, pid: route.pid }
+    );
   }
   if (staleRoutes.length > 5) {
-    add("warn", `${staleRoutes.length - 5} additional stale routes hidden.`);
+    add(
+      "routes.stale_hidden",
+      "warn",
+      `${staleRoutes.length - 5} additional stale routes hidden.`,
+      undefined,
+      { count: staleRoutes.length - 5 }
+    );
   }
 
   const routePortChecks = await Promise.all(
@@ -2854,31 +3038,45 @@ ${colors.bold("Options:")}
   for (const { route, invalidPort, listening } of routePortChecks) {
     if (invalidPort) {
       add(
+        "route.invalid_port",
         "warn",
         `Route ${route.hostname} has invalid port ${route.port}.`,
-        route.pid === 0 ? "Remove or recreate the alias." : "Run: portless prune"
+        route.pid === 0 ? "Remove or recreate the alias." : "Run: portless prune",
+        { hostname: route.hostname, port: route.port, pid: route.pid }
       );
       continue;
     }
     if (listening) continue;
     add(
+      "route.not_listening",
       "warn",
       `Route ${route.hostname} points to port ${route.port}, but nothing is listening there.`,
-      route.pid === 0 ? "Remove the alias or start that service." : "The app may still be starting."
+      route.pid === 0
+        ? "Remove the alias or start that service."
+        : "The app may still be starting.",
+      { hostname: route.hostname, port: route.port, pid: route.pid }
     );
   }
 
   if (state.lanMode || isLanEnvEnabled()) {
     const mdns = isMdnsSupported();
     if (mdns.supported) {
-      add("ok", "mDNS publishing support is available for LAN mode.");
+      add("lan.mdns_available", "ok", "mDNS publishing support is available for LAN mode.");
     } else {
-      add("fail", `LAN mode is enabled but mDNS publishing is unavailable: ${mdns.reason}`);
+      add(
+        "lan.mdns_unavailable",
+        "fail",
+        `LAN mode is enabled but mDNS publishing is unavailable: ${mdns.reason}`,
+        undefined,
+        { reason: mdns.reason }
+      );
     }
     if (state.lanIp) {
-      add("ok", `LAN IP is recorded: ${state.lanIp}`);
+      add("lan.ip_recorded", "ok", `LAN IP is recorded: ${state.lanIp}`, undefined, {
+        ip: state.lanIp,
+      });
     } else {
-      add("warn", "LAN mode is enabled but no LAN IP is recorded.");
+      add("lan.ip_missing", "warn", "LAN mode is enabled but no LAN IP is recorded.");
     }
   } else if (liveRoutes.length > 0) {
     const managedHosts = new Set(getManagedHostnames());
@@ -2891,32 +3089,73 @@ ${colors.bold("Options:")}
     );
     const unresolved = resolutionChecks.filter((result) => !result.resolves);
     if (unresolved.length === 0) {
-      add("ok", "Registered hostnames resolve through the system resolver.");
+      add("hosts.resolved", "ok", "Registered hostnames resolve through the system resolver.");
     } else {
       add(
+        "hosts.unresolved",
         "warn",
         `${pluralize(unresolved.length, "hostname")} did not resolve through the system resolver.`,
-        "Run: portless hosts sync"
+        "Run: portless hosts sync",
+        { count: unresolved.length }
       );
       for (const result of unresolved.slice(0, 5)) {
         const hostState = result.managed ? "present in hosts block" : "missing from hosts block";
-        add("warn", `${result.hostname} is ${hostState}.`);
+        add("hostname.unresolved", "warn", `${result.hostname} is ${hostState}.`, undefined, {
+          hostname: result.hostname,
+          managed: result.managed,
+        });
       }
     }
   }
 
+  const failures = findings.filter((finding) => finding.status === "fail").length;
+  const warnings = findings.filter((finding) => finding.status === "warn").length;
+  return {
+    recordedLanMode: state.lanMode,
+    metadata: {
+      version: __VERSION__,
+      nodeVersion: process.versions.node,
+      platform: process.platform,
+      arch: process.arch,
+      stateDir: state.dir,
+      proxy: {
+        url: formatUrl("127.0.0.1", proxyPort, proxyTls),
+        port: proxyPort,
+        tls: proxyTls,
+        running: proxyRunning,
+        portListening,
+        customCertificate: proxyUsesCustomCert,
+      },
+      tlds: state.tlds,
+      lan: { enabled: state.lanMode || isLanEnvEnabled(), ip: state.lanIp },
+    },
+    findings,
+    summary: { failures, warnings },
+  };
+}
+
+function printDoctorReport({ recordedLanMode, metadata, findings, summary }: DoctorReport): void {
+  console.log(colors.blue.bold("\nportless doctor\n"));
+  console.log(`Version: ${metadata.version}`);
+  console.log(`Node.js: ${metadata.nodeVersion}`);
+  console.log(`Platform: ${metadata.platform} ${metadata.arch}`);
+  console.log(`State dir: ${metadata.stateDir}`);
+  console.log(`Proxy target: ${metadata.proxy.url}`);
+  console.log(
+    `Mode: ${metadata.proxy.tls ? "HTTPS" : "HTTP"}, ${formatTldList(metadata.tlds)}${recordedLanMode ? ", LAN" : ""}`
+  );
+  console.log("");
   for (const finding of findings) {
     printDoctorFinding(finding);
   }
 
-  const failures = findings.filter((finding) => finding.status === "fail").length;
-  const warnings = findings.filter((finding) => finding.status === "warn").length;
+  const { failures, warnings } = summary;
   console.log("");
   if (failures > 0) {
     console.log(
       colors.red(`Summary: ${pluralize(failures, "failure")}, ${pluralize(warnings, "warning")}.`)
     );
-    process.exit(1);
+    return;
   }
   console.log(colors.green(`Summary: 0 failures, ${pluralize(warnings, "warning")}.`));
 }
@@ -4251,6 +4490,8 @@ async function handleNamedMode(args: string[]): Promise<void> {
 // Main
 // ---------------------------------------------------------------------------
 
+let jsonOutputCommand: JsonCommand | null = null;
+
 async function main() {
   if (process.stdin.isTTY) {
     process.on("exit", () => {
@@ -4263,20 +4504,6 @@ async function main() {
   }
 
   const args = process.argv.slice(2);
-
-  // Block one-off npx / pnpm dlx downloads. Running "sudo npx" is unsafe
-  // because it performs package resolution and downloads as root. When
-  // portless is installed as a project dependency the env vars still fire,
-  // so skip the block if we can find a local installation.
-  const isNpx = process.env.npm_command === "exec" && !process.env.npm_lifecycle_event;
-  const isPnpmDlx = !!process.env.PNPM_SCRIPT_SRC_DIR && !process.env.npm_lifecycle_event;
-  if ((isNpx || isPnpmDlx) && !isLocallyInstalled()) {
-    console.error(colors.red("Error: portless should not be run via npx or pnpm dlx."));
-    console.error(colors.blue("Install globally or as a project dependency:"));
-    console.error(colors.cyan("  npm install -g portless"));
-    console.error(colors.cyan("  npm install -D portless"));
-    process.exit(1);
-  }
 
   const globalBooleanFlags = new Set(["--lan", "--tailscale", "--funnel", "--ngrok"]);
   const globalValueFlags = new Set(["--ip", INTERNAL_LAN_IP_FLAG, "--script"]);
@@ -4364,12 +4591,73 @@ async function main() {
     return value;
   };
 
+  // Resolve JSON mode once, using the same flag definitions and child
+  // boundary as the existing CLI parser. Leave child flags untouched.
+  let json = false;
+  const jsonIndex = args.indexOf("--json");
+  const flagEnd = globalFlagEnd();
+  if (jsonIndex !== -1 && jsonIndex < flagEnd) {
+    const skipGlobalFlags = (start: number): number => {
+      let index = start;
+      while (index < flagEnd) {
+        if (globalBooleanFlags.has(args[index])) {
+          index++;
+        } else if (
+          globalValueFlags.has(args[index]) &&
+          args[index + 1] &&
+          !args[index + 1].startsWith("-")
+        ) {
+          index += 2;
+        } else {
+          break;
+        }
+      }
+      return index;
+    };
+    const commandIndex = skipGlobalFlags(0);
+    const actionIndex = skipGlobalFlags(commandIndex + 1);
+    const serviceStatus = args[commandIndex] === "service" && args[actionIndex] === "status";
+    if (
+      jsonIndex <= (serviceStatus ? actionIndex : commandIndex) ||
+      (!serviceStatus && !["list", "get", "doctor"].includes(args[commandIndex]))
+    ) {
+      throw new JsonArgumentError(
+        "--json is only supported by list, get, doctor, and service status."
+      );
+    }
+    jsonOutputCommand = serviceStatus ? "service status" : (args[commandIndex] as JsonCommand);
+    json = true;
+    if (args.slice(0, flagEnd).filter((arg) => arg === "--json").length > 1) {
+      throw new JsonArgumentError("--json may only be specified once.");
+    }
+    args.splice(jsonIndex, 1);
+  }
+
+  // Block one-off npx / pnpm dlx downloads. Running "sudo npx" is unsafe
+  // because it performs package resolution and downloads as root. When
+  // portless is installed as a project dependency the env vars still fire,
+  // so skip the block if we can find a local installation.
+  const isNpx = process.env.npm_command === "exec" && !process.env.npm_lifecycle_event;
+  const isPnpmDlx = !!process.env.PNPM_SCRIPT_SRC_DIR && !process.env.npm_lifecycle_event;
+  if ((isNpx || isPnpmDlx) && !isLocallyInstalled()) {
+    if (json)
+      throw new Error(
+        "portless should not be run via npx or pnpm dlx. Install it globally or as a project dependency."
+      );
+    console.error(colors.red("Error: portless should not be run via npx or pnpm dlx."));
+    console.error(colors.blue("Install globally or as a project dependency:"));
+    console.error(colors.cyan("  npm install -g portless"));
+    console.error(colors.cyan("  npm install -D portless"));
+    process.exit(1);
+  }
+
   if (stripGlobalFlag("--lan", false)) {
     process.env.PORTLESS_LAN = "1";
   }
 
   const ipResult = stripGlobalFlag("--ip", true);
   if (ipResult === false) {
+    if (json) throw new JsonArgumentError("--ip requires an IP address.");
     console.error(chalk.red("Error: --ip requires an IP address."));
     console.error(chalk.cyan("  portless --lan --ip 192.168.1.42 run <command>"));
     process.exit(1);
@@ -4380,6 +4668,7 @@ async function main() {
 
   const autoIpResult = stripGlobalFlag(INTERNAL_LAN_IP_FLAG, true);
   if (autoIpResult === false) {
+    if (json) throw new JsonArgumentError(`${INTERNAL_LAN_IP_FLAG} requires an IP address.`);
     console.error(chalk.red(`Error: ${INTERNAL_LAN_IP_FLAG} requires an IP address.`));
     process.exit(1);
   } else if (typeof autoIpResult === "string") {
@@ -4401,11 +4690,27 @@ async function main() {
   // --script flag: override the default "dev" script for zero-arg mode.
   const scriptResult = stripGlobalFlag("--script", true);
   if (scriptResult === false) {
+    if (json) throw new JsonArgumentError("--script requires a script name.");
     console.error(colors.red("Error: --script requires a script name."));
     console.error(colors.cyan("  portless --script start"));
     process.exit(1);
   }
   const globalScript = typeof scriptResult === "string" ? scriptResult : undefined;
+
+  if (json) {
+    const commandLength = jsonOutputCommand === "service status" ? 2 : 1;
+    const separator = args.indexOf("--");
+    const options = args.slice(commandLength, separator === -1 ? args.length : separator);
+    if (options.includes("--help") || options.includes("-h")) {
+      args.splice(1, args.length - 1, "--help");
+    } else if (jsonOutputCommand !== "get") {
+      const extra = args.slice(commandLength);
+      if (extra.length > 0 && !(extra.length === 1 && extra[0] === "--")) {
+        throw new JsonArgumentError(`Unknown argument "${extra[0]}".`);
+      }
+      args.splice(commandLength);
+    }
+  }
 
   // --name flag: treat the next arg as an explicit app name, bypassing
   // subcommand dispatch. Useful when the app name collides with a reserved
@@ -4446,6 +4751,7 @@ async function main() {
     process.env.PORTLESS === "skip";
   if (
     skipPortless &&
+    !json &&
     (isRunCommand ||
       args.length === 0 ||
       (args.length >= 2 &&
@@ -4502,15 +4808,15 @@ async function main() {
       return;
     }
     if (args[0] === "list") {
-      await handleList();
+      await handleList(args, json);
       return;
     }
     if (args[0] === "doctor") {
-      await handleDoctor(args);
+      await handleDoctor(args, json);
       return;
     }
     if (args[0] === "get") {
-      await handleGet(args);
+      await handleGet(args, json);
       return;
     }
     if (args[0] === "alias") {
@@ -4526,7 +4832,7 @@ async function main() {
       return;
     }
     if (args[0] === "service") {
-      await handleService(args, { entryScript: getEntryScript() });
+      await handleService(args, { entryScript: getEntryScript(), json });
       return;
     }
   }
@@ -4541,6 +4847,14 @@ async function main() {
 
 main().catch((err: unknown) => {
   const message = err instanceof Error ? err.message : String(err);
-  console.error(colors.red("Error:"), message);
+  if (jsonOutputCommand) {
+    writeJsonError(
+      jsonOutputCommand,
+      message,
+      err instanceof JsonArgumentError ? "INVALID_ARGUMENT" : "COMMAND_FAILED"
+    );
+  } else {
+    console.error(colors.red("Error:"), message);
+  }
   process.exit(1);
 });

@@ -387,10 +387,10 @@ describe("handleService", () => {
     errorSpy.mockRestore();
   });
 
-  it("prints help and exits 0 for --help", async () => {
+  it("prints human help and exits 0 for normalized JSON help", async () => {
     const runner = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
     await expect(
-      handleService(["service", "--help"], { entryScript: "/fake/cli.js", runner })
+      handleService(["service", "--help"], { entryScript: "/fake/cli.js", runner, json: true })
     ).rejects.toThrow("process.exit");
     expect(exitSpy).toHaveBeenCalledWith(0);
     const output = logSpy.mock.calls.map((c: unknown[]) => c.join(" ")).join("\n");
@@ -398,6 +398,8 @@ describe("handleService", () => {
     expect(output).toContain("service install");
     expect(output).toContain("service uninstall");
     expect(output).toContain("service status");
+    expect(output).toContain("Status options:");
+    expect(output).toContain("--json");
   });
 
   it("prints help and exits 0 when no subcommand is given", async () => {
@@ -918,4 +920,301 @@ describe("handleService", () => {
     expect(output).toContain("Wildcard: yes");
     expect(output).toContain("State directory: /srv/portless");
   });
+
+  it.each([["unexpected"], ["--help"], ["--", "--json"]])(
+    "ignores plain status trailing arguments %j",
+    async (...trailingArgs) => {
+      setPlatform("linux");
+      vi.mocked(existsSync).mockReturnValue(false);
+      vi.mocked(isProxyRunning).mockResolvedValue(false);
+      const runner = vi.fn(() => ({ status: 1, stdout: "", stderr: "" }));
+
+      await handleService(["service", "status", ...trailingArgs], {
+        entryScript: "/fake/cli.js",
+        runner,
+      });
+
+      const output = logSpy.mock.calls.flat().join(" ");
+      expect(output).toContain("Manager state: not installed");
+      expect(output).toContain("Installed: no");
+      expect(output).not.toContain("Status options:");
+      expect(runner).toHaveBeenCalledWith("systemctl", ["is-active", "portless.service"]);
+      expect(errorSpy).not.toHaveBeenCalled();
+      expect(exitSpy).not.toHaveBeenCalled();
+    }
+  );
+});
+
+describe("handleService JSON status", () => {
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+  let stdoutSpy: ReturnType<typeof vi.spyOn>;
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("process.exit");
+    });
+    stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.mocked(existsSync).mockReturnValue(false);
+    vi.mocked(isProxyRunning).mockResolvedValue(false);
+    vi.stubEnv("PORTLESS_STATE_DIR", "/fake/default-state");
+    vi.stubEnv("ProgramData", "C:\\ProgramData");
+  });
+
+  afterEach(() => {
+    exitSpy.mockRestore();
+    stdoutSpy.mockRestore();
+    logSpy.mockRestore();
+    errorSpy.mockRestore();
+    vi.unstubAllEnvs();
+  });
+
+  function readOutput() {
+    const output = stdoutSpy.mock.calls.map((call: unknown[]) => String(call[0])).join("");
+    expect(stdoutSpy).toHaveBeenCalledTimes(1);
+    expect(output).toMatch(/\n$/);
+    expect(output).not.toContain("\x1b");
+    expect(logSpy).not.toHaveBeenCalled();
+    expect(errorSpy).not.toHaveBeenCalled();
+    return JSON.parse(output);
+  }
+
+  describe.each(["darwin", "linux", "win32"] as const)("%s", (platform) => {
+    it.each([
+      { installed: true, proxyRunning: true },
+      { installed: true, proxyRunning: false },
+      { installed: false, proxyRunning: false },
+      { installed: false, proxyRunning: true },
+    ])("reports installed=$installed, proxyRunning=$proxyRunning", async (state) => {
+      setPlatform(platform);
+      const spec = buildServiceSpec({
+        platform,
+        nodePath: process.execPath,
+        entryScript: "/fake/cli.js",
+        userHome: "/fake/home",
+        installConfig: {
+          stateDir: "/fake/installed-state",
+          proxyPort: 8443,
+          useHttps: true,
+          tlds: ["localhost", "test"],
+          useWildcard: true,
+          customCertPath: "/private/cert.pem",
+          customKeyPath: "/private/key.pem",
+          extraEnv: { PORTLESS_SYNC_HOSTS: "1" },
+        },
+      });
+      const file =
+        spec.platform === "darwin"
+          ? spec.plistPath
+          : spec.platform === "linux"
+            ? spec.unitPath
+            : spec.scriptPath;
+      const contents =
+        spec.platform === "darwin"
+          ? spec.plist
+          : spec.platform === "linux"
+            ? spec.unit
+            : spec.script;
+      vi.mocked(existsSync).mockImplementation(
+        (candidate) => state.installed && candidate === file
+      );
+      vi.mocked(readFileSync).mockImplementation((candidate) =>
+        candidate === file ? contents : ""
+      );
+      vi.mocked(isProxyRunning).mockResolvedValue(state.proxyRunning);
+      const runner = vi.fn(() => ({
+        status: state.installed ? 0 : 1,
+        stdout:
+          platform === "darwin"
+            ? "state = running\npid = 42\n"
+            : platform === "linux"
+              ? "active\n"
+              : "Status: Running\n",
+        stderr: "",
+      }));
+
+      await handleService(["service", "status"], {
+        entryScript: "/fake/cli.js",
+        runner,
+        json: true,
+      });
+
+      const output = readOutput();
+      expect(output).toEqual({
+        schemaVersion: 1,
+        command: "service status",
+        installed: state.installed,
+        managerState: state.installed
+          ? platform === "darwin"
+            ? "running"
+            : platform === "linux"
+              ? "active"
+              : "Running"
+          : "not installed",
+        proxyRunning: state.proxyRunning,
+        platform,
+        config: {
+          proxyPort: state.installed ? 8443 : 443,
+          useHttps: true,
+          tlds: state.installed ? ["localhost", "test"] : ["localhost"],
+          lanMode: false,
+          lanIp: null,
+          useWildcard: state.installed,
+          stateDir: state.installed ? "/fake/installed-state" : "/fake/default-state",
+        },
+        serviceEntry:
+          spec.platform === "darwin"
+            ? spec.plistPath
+            : spec.platform === "linux"
+              ? spec.unitPath
+              : spec.taskName,
+      });
+      expect(JSON.stringify(output)).not.toContain("/private/");
+      expect(JSON.stringify(output)).not.toContain("PORTLESS_SYNC_HOSTS");
+      expect(isProxyRunning).toHaveBeenCalledWith(state.installed ? 8443 : 443, true);
+      expect(exitSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  it("reports the installed LAN config", async () => {
+    setPlatform("linux");
+    const spec = buildServiceSpec({
+      platform: "linux",
+      nodePath: process.execPath,
+      entryScript: "/fake/cli.js",
+      userHome: "/fake/home",
+      installConfig: {
+        stateDir: "/fake/lan-state",
+        proxyPort: 8080,
+        useHttps: false,
+        lanMode: true,
+        lanIp: "192.168.1.42",
+        lanIpExplicit: true,
+      },
+    });
+    if (spec.platform !== "linux") throw new Error("Expected Linux service spec");
+    vi.mocked(existsSync).mockImplementation((file) => file === spec.unitPath);
+    vi.mocked(readFileSync).mockReturnValue(spec.unit);
+    const runner = vi.fn(() => ({ status: 1, stdout: "inactive\n", stderr: "" }));
+
+    await handleService(["service", "status"], {
+      entryScript: "/fake/cli.js",
+      runner,
+      json: true,
+    });
+
+    expect(readOutput()).toMatchObject({
+      installed: true,
+      managerState: "installed",
+      proxyRunning: false,
+      config: {
+        proxyPort: 8080,
+        useHttps: false,
+        tlds: ["local"],
+        lanMode: true,
+        lanIp: "192.168.1.42",
+        useWildcard: false,
+        stateDir: "/fake/lan-state",
+      },
+    });
+    expect(isProxyRunning).toHaveBeenCalledWith(8080, false);
+  });
+
+  it("reports runtime failures as one JSON error", async () => {
+    setPlatform("linux");
+    const runner = vi.fn(() => {
+      throw new Error("service manager unavailable");
+    });
+    await expect(
+      handleService(["service", "status"], {
+        entryScript: "/fake/cli.js",
+        runner,
+        json: true,
+      })
+    ).rejects.toThrow("process.exit");
+
+    expect(readOutput()).toEqual({
+      schemaVersion: 1,
+      command: "service status",
+      error: { code: "COMMAND_FAILED", message: "service manager unavailable" },
+    });
+    expect(exitSpy).toHaveBeenCalledExactlyOnceWith(1);
+  });
+
+  it("reports unsupported platforms as JSON errors", async () => {
+    setPlatform("freebsd");
+    const runner = vi.fn(() => ({ status: 0 }));
+    await expect(
+      handleService(["service", "status"], { entryScript: "/fake/cli.js", runner, json: true })
+    ).rejects.toThrow("process.exit");
+
+    expect(readOutput()).toEqual({
+      schemaVersion: 1,
+      command: "service status",
+      error: { code: "COMMAND_FAILED", message: "Unsupported platform: freebsd" },
+    });
+    expect(exitSpy).toHaveBeenCalledExactlyOnceWith(1);
+    expect(runner).not.toHaveBeenCalled();
+    expect(isProxyRunning).not.toHaveBeenCalled();
+  });
+
+  it.each(["darwin", "linux", "win32"] as const)(
+    "reports %s service-manager spawn failures as JSON errors",
+    async (platform) => {
+      setPlatform(platform);
+      const runner = vi.fn(() => ({
+        status: null,
+        error: new Error("spawn service manager ENOENT"),
+      }));
+      await expect(
+        handleService(["service", "status"], { entryScript: "/fake/cli.js", runner, json: true })
+      ).rejects.toThrow("process.exit");
+
+      expect(readOutput()).toEqual({
+        schemaVersion: 1,
+        command: "service status",
+        error: { code: "COMMAND_FAILED", message: "spawn service manager ENOENT" },
+      });
+      expect(exitSpy).toHaveBeenCalledExactlyOnceWith(1);
+    }
+  );
+
+  it("reports Linux active-status spawn failures as JSON errors", async () => {
+    setPlatform("linux");
+    const runner = vi.fn((_: string, args: string[]) =>
+      args[0] === "is-active"
+        ? { status: null, error: new Error("spawn systemctl ETIMEDOUT") }
+        : { status: 0, stdout: "enabled\n" }
+    );
+    await expect(
+      handleService(["service", "status"], { entryScript: "/fake/cli.js", runner, json: true })
+    ).rejects.toThrow("process.exit");
+
+    expect(readOutput()).toEqual({
+      schemaVersion: 1,
+      command: "service status",
+      error: { code: "COMMAND_FAILED", message: "spawn systemctl ETIMEDOUT" },
+    });
+    expect(exitSpy).toHaveBeenCalledExactlyOnceWith(1);
+  });
+
+  it.each(["darwin", "linux", "win32"] as const)(
+    "preserves plain %s output when the service manager cannot be spawned",
+    async (platform) => {
+      setPlatform(platform);
+      const runner = vi.fn(() => ({
+        status: null,
+        error: new Error("spawn service manager ENOENT"),
+      }));
+      await handleService(["service", "status"], { entryScript: "/fake/cli.js", runner });
+
+      expect(logSpy.mock.calls.flat().join(" ")).toContain("Installed: no");
+      expect(stdoutSpy).not.toHaveBeenCalled();
+      expect(errorSpy).not.toHaveBeenCalled();
+      expect(exitSpy).not.toHaveBeenCalled();
+    }
+  );
 });

@@ -95,7 +95,7 @@ Print the URL for a service. Useful for wiring services together in scripts or e
 BACKEND_URL=$(portless get backend)
 ```
 
-Applies worktree prefix detection by default. Use `--no-worktree` to skip it.
+Applies worktree prefix detection by default. Use `--no-worktree` to skip it. Add `--json` to return the URL and worktree information as JSON.
 
 ## Alias (static routes)
 
@@ -119,7 +119,7 @@ portless alias --remove my-postgres # remove the alias
 portless list
 ```
 
-Shows active routes and their assigned ports.
+Shows active routes and their assigned ports. Add `--json` to return routes as JSON.
 
 ## Doctor
 
@@ -127,7 +127,7 @@ Shows active routes and their assigned ports.
 portless doctor
 ```
 
-Checks local portless health without changing state. It reports Node.js compatibility, state directory permissions, proxy liveness, route entries, HTTPS CA trust, hostname resolution, and LAN mode prerequisites, then prints suggested fixes.
+Checks local portless health without changing state. It reports Node.js compatibility, state directory permissions, proxy liveness, route entries, HTTPS CA trust, hostname resolution, and LAN mode prerequisites, then prints suggested fixes. Add `--json` to return diagnostic findings and summary counts as JSON.
 
 ## Trust the CA
 
@@ -228,7 +228,7 @@ portless service uninstall
 
 Installs the proxy as an OS startup service. The default is HTTPS on port 443 with `.localhost` names, but `service install` accepts proxy options including `--port`, `--no-tls`, `--lan`, `--ip`, `--tld`, `--wildcard`, `--cert`, and `--key`. Use `--state-dir <path>` or `PORTLESS_STATE_DIR=<path>` to choose where service state and logs are written.
 
-The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. `portless service status` reports the installed port, HTTPS mode, TLDs, LAN mode, wildcard mode, and state directory. macOS and Linux use a root-owned service so port 443 can bind at boot. Windows uses a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
+The chosen service configuration is written into launchd, systemd, or Task Scheduler and reused after reboot. `portless service status` reports the installed port, HTTPS mode, TLDs, LAN mode, wildcard mode, and state directory. Add `--json` to this command to return the status as JSON. macOS and Linux use a root-owned service so port 443 can bind at boot. Windows uses a Task Scheduler startup task that runs as SYSTEM. Installation and removal may require administrator privileges. `portless clean` automatically removes the service.
 
 ### LAN mode
 
